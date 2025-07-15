@@ -9,7 +9,11 @@ use log::{debug, error, info};
 use std::io::Result as IoResult;
 use tokio::{net::UdpSocket, sync::oneshot};
 
-use crate::Device;
+use crate::{Device, NotifyMessage};
+
+#[allow(dead_code)]
+type NotifyRx = tokio::sync::mpsc::Receiver<Arc<NotifyMessage>>;
+type NotifyTx = tokio::sync::mpsc::Sender<Arc<NotifyMessage>>;
 
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
@@ -23,6 +27,7 @@ pub struct Server {
     max_age: u64,
     devices: Vec<Device>,
     headers: Vec<(String, String)>,
+    notify_req_tx: Option<NotifyTx>,
 }
 
 impl Server {
@@ -45,6 +50,7 @@ impl Server {
             max_age: 100,
             devices: devices.into_iter().collect(),
             headers: vec![],
+            notify_req_tx: None,
         }
     }
 
@@ -77,6 +83,13 @@ impl Server {
     /// ```
     pub fn extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Add a sender for `NotifyRequest` messages.
+    /// This is useful if you want to handle `NOTIFY` messages in your application.
+    pub fn notify_req_tx(mut self, tx: NotifyTx) -> Self {
+        self.notify_req_tx = Some(tx);
         self
     }
 
@@ -113,13 +126,13 @@ impl Server {
         let extra_headers = Arc::new(
             this.headers
                 .iter()
-                .map(|(name, value)| format!("{}: {}", name, value))
+                .map(|(name, value)| format!("{name}: {value}"))
                 .collect::<Vec<_>>()
                 .join("\r\n"),
         );
 
         let server_fut = async move {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 4096];
 
             let (_notify_alive_tx, mut notify_alive_rx) = oneshot::channel::<()>();
             tokio::spawn({
@@ -130,7 +143,7 @@ impl Server {
                 async move {
                     loop {
                         if let Err(e) = this.broadcast_alive(&socket, &extra_headers).await {
-                            error!("Send alive messages failed: {}", e);
+                            error!("Send alive messages failed: {e}");
                         }
 
                         tokio::select! {
@@ -157,7 +170,7 @@ impl Server {
                     let _ = notify_byebye_rx.await;
 
                     if let Err(e) = this.broadcast_byebye(&socket, &extra_headers).await {
-                        error!("Send byebye messages failed: {}", e);
+                        error!("Send byebye messages failed: {e}");
                     }
                 }
             });
@@ -186,17 +199,41 @@ impl Server {
                             let socket = Arc::clone(&socket);
                             let res = this.handle_search(&req, socket, addr, &extra_headers).await;
                             if let Err(e) = res {
-                                error!("Handle search failed: {}", e);
+                                error!("Handle search failed: {e}");
                             }
                         }
-                        ("NOTIFY", "*") => debug!("NOTIFY * from {}", addr),
-                        _ => debug!("Unknown SSDP request {} {} from {}", method, path, addr),
+                        ("NOTIFY", _) => {
+                            let nr = NotifyMessage {
+                                remote_addr: addr,
+                                data: buf[..n].to_vec(),
+                            };
+                            let _res = this.handle_notify(Arc::new(nr)).await;
+                        }
+                        _ => debug!("Unknown SSDP request {method} {path} from {addr}"),
                     }
                 }
             }
         };
 
         Ok(server_fut)
+    }
+
+    async fn handle_notify(&self, nr: Arc<NotifyMessage>) -> IoResult<()> {
+        debug!(
+            "Received NOTIFY from {} with {} bytes",
+            nr.remote_addr,
+            nr.data.len()
+        );
+
+        if let Some(tx) = &self.notify_req_tx {
+            if tx.send(nr).await.is_err() {
+                error!("Failed to send notify request");
+            }
+        } else {
+            debug!("No notify request sender configured, ignoring NOTIFY");
+        }
+
+        Ok(())
     }
 
     async fn handle_search(
@@ -259,7 +296,7 @@ impl Server {
             ));
         };
 
-        debug!("ST={:?}, MX={:?}", st, mx);
+        debug!("ST={st:?}, MX={mx:?}");
 
         let device = if let Some(s) = self
             .devices
@@ -271,9 +308,9 @@ impl Server {
             return Ok(());
         };
 
-        debug!("Matched {:?}", device);
+        debug!("Matched {device:?}");
 
-        let response = format!(
+        let mut response = format!(
             concat!(
                 "HTTP/1.1 200 OK\r\n",
                 "CACHE-CONTROL: max-age=100\r\n",
@@ -284,7 +321,6 @@ impl Server {
                 "ST: {st}\r\n",
                 "USN: {usn}\r\n",
                 "{headers}",
-                "\r\n"
             ),
             date = httpdate::fmt_http_date(SystemTime::now()),
             loc = device.location,
@@ -294,14 +330,25 @@ impl Server {
             headers = extra_headers
         );
 
-        debug!("Response: {}", response);
+        if let Some(content_type) = &device.content_type {
+            response.push_str(&format!("CONTENT-TYPE: {content_type}\r\n"));
+        }
+        if let Some(body) = &device.body {
+            response.push_str(&format!("CONTENT-LENGTH: {}\r\n", body.len()));
+            response.push_str("\r\n");
+            response.push_str(body);
+        } else {
+            response.push_str("\r\n");
+        }
+
+        debug!("Response: {response}");
 
         tokio::spawn(async move {
             if mx > 0 {
                 tokio::time::sleep(Duration::from_secs(mx as u64)).await;
             }
             if let Err(e) = socket.send_to(response.as_bytes(), remote_addr).await {
-                error!("Failed to send search response: {}", e);
+                error!("Failed to send search response: {e}");
             }
         });
 
@@ -313,7 +360,7 @@ impl Server {
         debug!("Sending alive messages");
 
         for device in self.devices.iter() {
-            let message = format!(
+            let mut message = format!(
                 concat!(
                     "NOTIFY * HTTP/1.1\r\n",
                     "HOST: {ssdp_addr}:{ssdp_port}\r\n",
@@ -324,7 +371,6 @@ impl Server {
                     "SERVER: {server}\r\n",
                     "USN: {usn}\r\n",
                     "{headers}",
-                    "\r\n"
                 ),
                 ssdp_addr = SSDP_ADDR,
                 ssdp_port = SSDP_PORT,
@@ -335,7 +381,18 @@ impl Server {
                 headers = extra_headers
             );
 
-            debug!("Alive message: {}", message);
+            if let Some(content_type) = &device.content_type {
+                message.push_str(&format!("CONTENT-TYPE: {content_type}\r\n"));
+            }
+            if let Some(body) = &device.body {
+                message.push_str(&format!("CONTENT-LENGTH: {}\r\n", body.len()));
+                message.push_str("\r\n");
+                message.push_str(body);
+            } else {
+                message.push_str("\r\n");
+            }
+
+            debug!("Alive message: {message}");
 
             socket
                 .send_to(message.as_bytes(), (SSDP_ADDR, SSDP_PORT))
@@ -353,7 +410,7 @@ impl Server {
         debug!("Sending byebye messages");
 
         for device in self.devices.iter() {
-            let message = format!(
+            let mut message = format!(
                 concat!(
                     "NOTIFY * HTTP/1.1\r\n",
                     "HOST: {ssdp_addr}:{ssdp_port}\r\n",
@@ -370,7 +427,18 @@ impl Server {
                 headers = extra_headers
             );
 
-            debug!("Byebye message: {}", message);
+            if let Some(content_type) = &device.content_type {
+                message.push_str(&format!("CONTENT-TYPE: {content_type}\r\n"));
+            }
+            if let Some(body) = &device.body {
+                message.push_str(&format!("CONTENT-LENGTH: {}\r\n", body.len()));
+                message.push_str("\r\n");
+                message.push_str(body);
+            } else {
+                message.push_str("\r\n");
+            }
+
+            debug!("Byebye message: {message}");
 
             socket
                 .send_to(message.as_bytes(), (SSDP_ADDR, SSDP_PORT))

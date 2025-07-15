@@ -6,6 +6,8 @@ pub struct Device {
     pub(crate) usn: String,
     pub(crate) search_target: String,
     pub(crate) location: String,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Option<String>,
 }
 
 impl Device {
@@ -35,12 +37,21 @@ impl Device {
             format!("uuid:{}::{}", uuid.as_ref(), st)
         };
 
-        debug!("USN: {}", usn);
+        debug!("USN: {usn}");
 
         Self {
             usn,
             search_target: st,
             location: location.into(),
+            content_type: None,
+            body: None,
         }
+    }
+
+    /// Set the body of the SSDP response.
+    pub fn with_body(mut self, content_type: impl Into<String>, body: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self.body = Some(body.into());
+        self
     }
 }
