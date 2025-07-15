@@ -415,10 +415,9 @@ impl Server {
                     "NOTIFY * HTTP/1.1\r\n",
                     "HOST: {ssdp_addr}:{ssdp_port}\r\n",
                     "NT: {st}\r\n",
-                    "NTS: ssdp:alive\r\n",
+                    "NTS: ssdp:byebye\r\n",
                     "USN: {usn}\r\n",
                     "{headers}",
-                    "\r\n"
                 ),
                 ssdp_addr = SSDP_ADDR,
                 ssdp_port = SSDP_PORT,
