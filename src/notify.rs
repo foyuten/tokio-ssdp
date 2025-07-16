@@ -128,3 +128,14 @@ pub struct NotifyResponse {
     /// The body of the response, which can contain additional information.
     pub body: String,
 }
+
+impl Default for NotifyResponse {
+    fn default() -> Self {
+        NotifyResponse {
+            remote_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            status_code: 200,
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+}
